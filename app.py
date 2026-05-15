@@ -23,7 +23,7 @@ DATA_DIR = BASE / "data"
 # GeoJSON com os estados do Brasil (propriedade sigla = UF, ex: "AC", "SP")
 BRAZIL_GEOJSON_URL = (
     "https://raw.githubusercontent.com/giuliano-macedo/"
-    "geodata-br-states/main/geojson/br_states.geojson"
+    "geodata-br-states/main/geojson/br_states.json"
 )
 
 STATE_NAMES = {
@@ -186,10 +186,66 @@ def _http_get(url: str, timeout: int = 8) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=86400)
 def load_brazil_geojson():
+    """
+    Carrega o mapa dos estados do Brasil.
+
+    Ele tenta, nesta ordem:
+    1. data/br_states.json
+    2. data/data/br_states.json
+    3. br_states.json na raiz do projeto
+    4. link online do GitHub
+    """
+
+    possible_paths = [
+        DATA_DIR / "br_states.json",
+        DATA_DIR / "data" / "br_states.json",
+        BASE / "br_states.json",
+    ]
+
+    for path in possible_paths:
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as file:
+                    geojson = json.load(file)
+                return fix_geojson_uf_key(geojson)
+            except Exception as e:
+                st.warning(f"Encontrei o arquivo {path}, mas não consegui ler: {e}")
+
     try:
-        return _http_get(BRAZIL_GEOJSON_URL, timeout=15)
-    except Exception:
+        geojson = _http_get(BRAZIL_GEOJSON_URL, timeout=20)
+        return fix_geojson_uf_key(geojson)
+    except Exception as e:
+        st.warning(f"Não consegui baixar o mapa online: {e}")
         return None
+
+
+def fix_geojson_uf_key(geojson):
+    """
+    Garante que cada estado tenha a propriedade 'sigla',
+    que é a chave usada pelo Plotly para desenhar o mapa.
+    """
+
+    if not geojson or "features" not in geojson:
+        return None
+
+    for feature in geojson["features"]:
+        props = feature.get("properties", {})
+
+        uf = (
+            props.get("sigla")
+            or props.get("SIGLA")
+            or props.get("uf")
+            or props.get("UF")
+            or props.get("id")
+            or props.get("ID")
+        )
+
+        if uf:
+            props["sigla"] = str(uf).upper().replace("BR-", "").strip()
+
+        feature["properties"] = props
+
+    return geojson
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -352,6 +408,134 @@ def make_state_summary(df: pd.DataFrame) -> pd.DataFrame:
 # Mapa — GeoJSON: somente Brasil, nenhum país vizinho
 # ─────────────────────────────────────────────────────────────────────────────
 def make_brazil_map(summary: pd.DataFrame, selected_uf: str | None = None):
+    geojson = load_brazil_geojson()
+    fig = go.Figure()
+
+    if not geojson:
+        fig.add_annotation(
+            text=(
+                "<b>Não foi possível carregar o mapa dos estados do Brasil.</b><br><br>"
+                "Confira se o arquivo <b>br_states.json</b> está em uma destas opções:<br>"
+                "data/br_states.json<br>"
+                "data/data/br_states.json<br>"
+                "br_states.json"
+            ),
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+            font=dict(color="white", size=14),
+            align="center",
+        )
+
+        fig.update_xaxes(visible=False)
+        fig.update_yaxes(visible=False)
+
+        fig.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            margin=dict(l=0, r=0, t=0, b=0),
+            height=500,
+        )
+
+        return fig
+
+    summary_map = summary.copy()
+    summary_map["UF"] = summary_map["UF"].astype(str).str.upper().str.strip()
+
+    fig.add_trace(
+        go.Choropleth(
+            geojson=geojson,
+            featureidkey="properties.sigla",
+            locations=summary_map["UF"],
+            z=summary_map["num_eleitos"],
+            colorscale=[
+                [0.0, "#132238"],
+                [0.25, "#1d3557"],
+                [0.50, "#457b9d"],
+                [0.75, "#2a9d8f"],
+                [1.0, "#90e0ef"],
+            ],
+            customdata=summary_map[
+                ["UF", "state_name", "num_eleitos", "num_zonas"]
+            ].values,
+            hovertemplate=(
+                "<b>%{customdata[1]} (%{customdata[0]})</b><br>"
+                "Eleitos: %{customdata[2]}<br>"
+                "Zonas eleitorais: %{customdata[3]}"
+                "<extra></extra>"
+            ),
+            marker_line_color="rgba(255,255,255,0.45)",
+            marker_line_width=0.8,
+            colorbar=dict(
+                title=dict(text="Eleitos", font=dict(color="white")),
+                tickfont=dict(color="white"),
+            ),
+        )
+    )
+
+    if selected_uf:
+        selected_uf = str(selected_uf).upper().strip()
+
+        selected_summary = summary_map[summary_map["UF"] == selected_uf]
+
+        if not selected_summary.empty:
+            selected_name = selected_summary.iloc[0]["state_name"]
+            selected_eleitos = selected_summary.iloc[0]["num_eleitos"]
+            selected_zonas = selected_summary.iloc[0]["num_zonas"]
+        else:
+            selected_name = STATE_NAMES_DISPLAY.get(selected_uf, selected_uf)
+            selected_eleitos = 0
+            selected_zonas = 0
+
+        fig.add_trace(
+            go.Choropleth(
+                geojson=geojson,
+                featureidkey="properties.sigla",
+                locations=[selected_uf],
+                z=[1],
+                colorscale=[
+                    [0, "rgba(255, 215, 0, 0.90)"],
+                    [1, "rgba(255, 215, 0, 0.90)"],
+                ],
+                showscale=False,
+                customdata=[[selected_uf, selected_name, selected_eleitos, selected_zonas]],
+                hovertemplate=(
+                    "<b>%{customdata[1]} (%{customdata[0]})</b><br>"
+                    "Estado selecionado<br>"
+                    "Eleitos: %{customdata[2]}<br>"
+                    "Zonas eleitorais: %{customdata[3]}"
+                    "<extra></extra>"
+                ),
+                marker_line_color="white",
+                marker_line_width=3.5,
+            )
+        )
+
+    fig.update_geos(
+        visible=False,
+        fitbounds="locations",
+        projection_type="mercator",
+        showframe=False,
+        showcoastlines=False,
+        showcountries=False,
+        showland=False,
+        showocean=False,
+        showlakes=False,
+        bgcolor="rgba(0,0,0,0)",
+    )
+
+    fig.update_layout(
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=500,
+        font=dict(color="white"),
+        dragmode=False,
+    )
+
+    return fig
     """
     Cria um mapa APENAS com os estados do Brasil.
 
