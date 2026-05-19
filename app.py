@@ -20,11 +20,24 @@ st.set_page_config(
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / "data"
 
-# GeoJSON com os estados do Brasil (propriedade sigla = UF, ex: "AC", "SP")
+# GeoJSON oficial do IBGE — estados brasileiros com alta resolução de bordas
+# qualidade=intermediario é o melhor custo-benefício (alta detail, tamanho razoável)
 BRAZIL_GEOJSON_URL = (
-    "https://raw.githubusercontent.com/giuliano-macedo/"
-    "geodata-br-states/main/geojson/br_states.json"
+    "https://servicodados.ibge.gov.br/api/v3/malhas/paises/BR"
+    "?formato=application/vnd.geo+json&qualidade=intermediario&intrarregiao=UF"
 )
+
+# Códigos geocode do IBGE para cada UF (propriedade "codarea" no GeoJSON)
+IBGE_UF_CODES: dict[str, str] = {
+    "RO": "11", "AC": "12", "AM": "13", "RR": "14", "PA": "15", "AP": "16", "TO": "17",
+    "MA": "21", "PI": "22", "CE": "23", "RN": "24", "PB": "25", "PE": "26",
+    "AL": "27", "SE": "28", "BA": "29",
+    "MG": "31", "ES": "32", "RJ": "33", "SP": "35",
+    "PR": "41", "SC": "42", "RS": "43",
+    "MS": "50", "MT": "51", "GO": "52", "DF": "53",
+}
+# Mapeamento inverso: código IBGE → sigla UF
+IBGE_TO_UF: dict[str, str] = {v: k for k, v in IBGE_UF_CODES.items()}
 
 STATE_NAMES = {
     "AC": "Acre", "AL": "Alagoas", "AM": "Amazonas", "AP": "Amapa",
@@ -186,66 +199,10 @@ def _http_get(url: str, timeout: int = 8) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner=False, ttl=86400)
 def load_brazil_geojson():
-    """
-    Carrega o mapa dos estados do Brasil.
-
-    Ele tenta, nesta ordem:
-    1. data/br_states.json
-    2. data/data/br_states.json
-    3. br_states.json na raiz do projeto
-    4. link online do GitHub
-    """
-
-    possible_paths = [
-        DATA_DIR / "br_states.json",
-        DATA_DIR / "data" / "br_states.json",
-        BASE / "br_states.json",
-    ]
-
-    for path in possible_paths:
-        if path.exists():
-            try:
-                with open(path, "r", encoding="utf-8") as file:
-                    geojson = json.load(file)
-                return fix_geojson_uf_key(geojson)
-            except Exception as e:
-                st.warning(f"Encontrei o arquivo {path}, mas não consegui ler: {e}")
-
     try:
-        geojson = _http_get(BRAZIL_GEOJSON_URL, timeout=20)
-        return fix_geojson_uf_key(geojson)
-    except Exception as e:
-        st.warning(f"Não consegui baixar o mapa online: {e}")
+        return _http_get(BRAZIL_GEOJSON_URL, timeout=15)
+    except Exception:
         return None
-
-
-def fix_geojson_uf_key(geojson):
-    """
-    Garante que cada estado tenha a propriedade 'sigla',
-    que é a chave usada pelo Plotly para desenhar o mapa.
-    """
-
-    if not geojson or "features" not in geojson:
-        return None
-
-    for feature in geojson["features"]:
-        props = feature.get("properties", {})
-
-        uf = (
-            props.get("sigla")
-            or props.get("SIGLA")
-            or props.get("uf")
-            or props.get("UF")
-            or props.get("id")
-            or props.get("ID")
-        )
-
-        if uf:
-            props["sigla"] = str(uf).upper().replace("BR-", "").strip()
-
-        feature["properties"] = props
-
-    return geojson
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,254 +362,97 @@ def make_state_summary(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Mapa — GeoJSON: somente Brasil, nenhum país vizinho
+# Mapa — GeoJSON IBGE: somente Brasil, bordas precisas, sem barra de cores
 # ─────────────────────────────────────────────────────────────────────────────
 def make_brazil_map(summary: pd.DataFrame, selected_uf: str | None = None):
     geojson = load_brazil_geojson()
     fig = go.Figure()
 
-    if not geojson:
-        fig.add_annotation(
-            text=(
-                "<b>Não foi possível carregar o mapa dos estados do Brasil.</b><br><br>"
-                "Confira se o arquivo <b>br_states.json</b> está em uma destas opções:<br>"
-                "data/br_states.json<br>"
-                "data/data/br_states.json<br>"
-                "br_states.json"
-            ),
-            x=0.5,
-            y=0.5,
-            xref="paper",
-            yref="paper",
-            showarrow=False,
-            font=dict(color="white", size=14),
-            align="center",
-        )
-
-        fig.update_xaxes(visible=False)
-        fig.update_yaxes(visible=False)
-
-        fig.update_layout(
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            margin=dict(l=0, r=0, t=0, b=0),
-            height=500,
-        )
-
-        return fig
-
-    summary_map = summary.copy()
-    summary_map["UF"] = summary_map["UF"].astype(str).str.upper().str.strip()
-
-    fig.add_trace(
-        go.Choropleth(
-            geojson=geojson,
-            featureidkey="properties.sigla",
-            locations=summary_map["UF"],
-            z=summary_map["num_eleitos"],
-            colorscale=[
-                [0.0, "#132238"],
-                [0.25, "#1d3557"],
-                [0.50, "#457b9d"],
-                [0.75, "#2a9d8f"],
-                [1.0, "#90e0ef"],
-            ],
-            customdata=summary_map[
-                ["UF", "state_name", "num_eleitos", "num_zonas"]
-            ].values,
-            hovertemplate=(
-                "<b>%{customdata[1]} (%{customdata[0]})</b><br>"
-                "Eleitos: %{customdata[2]}<br>"
-                "Zonas eleitorais: %{customdata[3]}"
-                "<extra></extra>"
-            ),
-            marker_line_color="rgba(255,255,255,0.45)",
-            marker_line_width=0.8,
-            colorbar=dict(
-                title=dict(text="Eleitos", font=dict(color="white")),
-                tickfont=dict(color="white"),
-            ),
-        )
-    )
-
-    if selected_uf:
-        selected_uf = str(selected_uf).upper().strip()
-
-        selected_summary = summary_map[summary_map["UF"] == selected_uf]
-
-        if not selected_summary.empty:
-            selected_name = selected_summary.iloc[0]["state_name"]
-            selected_eleitos = selected_summary.iloc[0]["num_eleitos"]
-            selected_zonas = selected_summary.iloc[0]["num_zonas"]
-        else:
-            selected_name = STATE_NAMES_DISPLAY.get(selected_uf, selected_uf)
-            selected_eleitos = 0
-            selected_zonas = 0
-
-        fig.add_trace(
-            go.Choropleth(
-                geojson=geojson,
-                featureidkey="properties.sigla",
-                locations=[selected_uf],
-                z=[1],
-                colorscale=[
-                    [0, "rgba(255, 215, 0, 0.90)"],
-                    [1, "rgba(255, 215, 0, 0.90)"],
-                ],
-                showscale=False,
-                customdata=[[selected_uf, selected_name, selected_eleitos, selected_zonas]],
-                hovertemplate=(
-                    "<b>%{customdata[1]} (%{customdata[0]})</b><br>"
-                    "Estado selecionado<br>"
-                    "Eleitos: %{customdata[2]}<br>"
-                    "Zonas eleitorais: %{customdata[3]}"
-                    "<extra></extra>"
-                ),
-                marker_line_color="white",
-                marker_line_width=3.5,
-            )
-        )
-
-    fig.update_geos(
-        visible=False,
-        fitbounds="locations",
-        projection_type="mercator",
-        showframe=False,
-        showcoastlines=False,
-        showcountries=False,
-        showland=False,
-        showocean=False,
-        showlakes=False,
-        bgcolor="rgba(0,0,0,0)",
-    )
-
-    fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        margin=dict(l=0, r=0, t=0, b=0),
-        height=500,
-        font=dict(color="white"),
-        dragmode=False,
-    )
-
-    return fig
-    """
-    Cria um mapa APENAS com os estados do Brasil.
-
-    O ponto principal aqui é NÃO usar a camada geográfica padrão do Plotly
-    como fundo do mapa, porque ela pode exibir países vizinhos. Por isso,
-    usamos geo.visible=False e desenhamos somente os polígonos do GeoJSON
-    brasileiro.
-    """
-    geojson = load_brazil_geojson()
-    fig = go.Figure()
-
-    # Garante que o mapa sempre desenhe os 27 estados, mesmo que algum UF
-    # não apareça no CSV carregado.
-    all_states = pd.DataFrame({
-        "UF": list(STATE_NAMES_DISPLAY.keys()),
-        "state_name": list(STATE_NAMES_DISPLAY.values()),
-    })
-    map_summary = all_states.merge(
-        summary[["UF", "num_eleitos", "num_zonas"]],
-        on="UF",
-        how="left",
-    )
-    map_summary["num_eleitos"] = map_summary["num_eleitos"].fillna(0).astype(int)
-    map_summary["num_zonas"] = map_summary["num_zonas"].fillna(0).astype(int)
-
     if geojson:
-        # Trace principal: todos os estados brasileiros.
+        # Adiciona código IBGE ao summary para fazer o match com o GeoJSON
+        s = summary.copy()
+        s["ibge"] = s["UF"].map(IBGE_UF_CODES)
+        s = s.dropna(subset=["ibge"])   # remove UFs sem código (não deve acontecer)
+
+        # ── Trace base: todos os estados coloridos por nº de eleitos ─────────
         fig.add_trace(go.Choropleth(
             geojson=geojson,
-            featureidkey="properties.sigla",
-            locations=map_summary["UF"],
-            z=map_summary["num_eleitos"],
-            colorscale=[
-                [0.00, "#1b263b"],
-                [0.25, "#274c77"],
-                [0.50, "#468faf"],
-                [0.75, "#61a5c2"],
-                [1.00, "#89c2d9"],
-            ],
-            customdata=map_summary[["UF", "state_name", "num_eleitos", "num_zonas"]].values,
+            featureidkey="properties.codarea",  # campo do GeoJSON IBGE
+            locations=s["ibge"],
+            z=s["num_eleitos"],
+            colorscale="Blues",
+            showscale=False,                    # ← SEM barra de cores
+            customdata=s[["UF", "state_name", "num_eleitos", "num_zonas"]].values,
             hovertemplate=(
-                "<b>%{customdata[1]} (%{customdata[0]})</b><br>"
+                "<b>%{customdata[1]}</b><br>"
                 "Eleitos: %{customdata[2]}<br>"
                 "Zonas: %{customdata[3]}<extra></extra>"
             ),
-            colorbar=dict(
-                title=dict(text="Eleitos", font=dict(color="white")),
-                tickfont=dict(color="white"),
-                bgcolor="rgba(13,17,23,0.92)",
-                bordercolor="rgba(255,255,255,0.15)",
-                borderwidth=1,
-            ),
-            marker_line_color="rgba(255,255,255,0.35)",
-            marker_line_width=0.7,
-            showscale=True,
+            marker_line_color="rgba(180,190,210,0.7)",
+            marker_line_width=1.0,
         ))
 
-        # Trace de destaque: mantém o mapa inteiro do Brasil e pinta somente
-        # o estado filtrado com preenchimento forte e borda grossa.
+        # ── Trace de destaque: estado selecionado em dourado ─────────────────
         if selected_uf:
-            selected_name = STATE_NAMES_DISPLAY.get(selected_uf, selected_uf)
-            fig.add_trace(go.Choropleth(
-                geojson=geojson,
-                featureidkey="properties.sigla",
-                locations=[selected_uf],
-                z=[1],
-                colorscale=[[0, "#ffd60a"], [1, "#ffd60a"]],
-                customdata=[[selected_uf, selected_name]],
-                hovertemplate="<b>%{customdata[1]} (%{customdata[0]})</b><br>Estado selecionado<extra></extra>",
-                showscale=False,
-                marker_line_color="#ffffff",
-                marker_line_width=3.8,
-                opacity=0.92,
-            ))
+            ibge_sel = IBGE_UF_CODES.get(selected_uf)
+            if ibge_sel:
+                fig.add_trace(go.Choropleth(
+                    geojson=geojson,
+                    featureidkey="properties.codarea",
+                    locations=[ibge_sel],
+                    z=[1],
+                    colorscale=[[0, "rgba(255,210,0,0.72)"], [1, "rgba(255,210,0,0.72)"]],
+                    showscale=False,
+                    hoverinfo="skip",
+                    marker_line_color="rgba(255,210,0,1)",
+                    marker_line_width=3.0,
+                ))
 
-        # Esta configuração é o que impede aparecer Argentina, Bolívia,
-        # Paraguai, oceano, fronteiras ou qualquer outro país.
         geo = dict(
-            visible=False,             # remove o mapa-múndi de fundo do Plotly
-            fitbounds="locations",     # enquadra nos polígonos desenhados: Brasil
-            projection_type="mercator",
+            showframe=False,
+            showcoastlines=False,
+            showland=False,
+            showocean=False,
+            showcountries=False,
+            showlakes=False,
             bgcolor="rgba(13,17,23,1)",
+            fitbounds="locations",
+            projection_type="mercator",
         )
-
     else:
-        # Sem GeoJSON não é possível desenhar corretamente os estados.
-        # Em vez de mostrar mapa-múndi ou países vizinhos, exibimos um aviso limpo.
-        fig.add_annotation(
-            text="Não foi possível carregar o mapa dos estados do Brasil.",
-            x=0.5,
-            y=0.56,
-            xref="paper",
-            yref="paper",
-            showarrow=False,
-            font=dict(color="white", size=15),
+        # ── Fallback ISO-3 sem GeoJSON ────────────────────────────────────────
+        s2 = summary.copy()
+        s2["iso"] = "BR-" + s2["UF"]
+        fig.add_trace(go.Choropleth(
+            locations=s2["iso"], locationmode="ISO-3",
+            z=s2["num_eleitos"], colorscale="Blues",
+            showscale=False,                    # ← SEM barra de cores
+            customdata=s2[["UF", "state_name", "num_eleitos", "num_zonas"]].values,
+            hovertemplate="<b>%{customdata[1]}</b><br>Eleitos: %{customdata[2]}<extra></extra>",
+            marker_line_color="rgba(180,190,210,0.7)", marker_line_width=1.0,
+        ))
+        if selected_uf:
+            fig.add_trace(go.Choropleth(
+                locations=["BR-" + selected_uf], locationmode="ISO-3",
+                z=[1], colorscale=[[0, "rgba(255,210,0,0.72)"], [1, "rgba(255,210,0,0.72)"]],
+                showscale=False, hoverinfo="skip",
+                marker_line_color="rgba(255,210,0,1)", marker_line_width=3.0,
+            ))
+        geo = dict(
+            bgcolor="rgba(13,17,23,1)", lakecolor="rgba(13,17,23,1)",
+            landcolor="rgba(40,40,60,1)", showland=True, showcoastlines=False,
+            showframe=False, showocean=True, oceancolor="rgba(13,17,23,1)",
+            showcountries=False, projection_type="mercator",
+            center=dict(lat=-14, lon=-52),
+            lataxis=dict(range=[-34, 6], showgrid=False),
+            lonaxis=dict(range=[-74, -28], showgrid=False),
         )
-        fig.add_annotation(
-            text="Verifique sua conexão ou baixe o GeoJSON para a pasta do projeto.",
-            x=0.5,
-            y=0.48,
-            xref="paper",
-            yref="paper",
-            showarrow=False,
-            font=dict(color="#8b949e", size=12),
-        )
-        geo = dict(visible=False, bgcolor="rgba(13,17,23,1)")
 
     fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=0, r=0, t=0, b=0),
-        geo=geo,
-        height=520,
-        font=dict(color="white"),
-        dragmode=False,
+        geo=geo, height=500, font=dict(color="white"), dragmode=False,
     )
-
     return fig
 
 
@@ -959,8 +759,13 @@ with left:
         points = (map_event.get("selection", {}).get("points", [])
                   if isinstance(map_event, dict) else [])
         if points:
-            loc = str(points[0].get("location", "")).replace("BR-", "").upper()
-            if loc in ufs and loc != st.session_state.selected_uf:
+            loc = str(points[0].get("location", ""))
+            # Com GeoJSON IBGE, location = código numérico ("12"); fallback = "BR-AC" ou "AC"
+            clicked_uf = (
+                IBGE_TO_UF.get(loc)                          # IBGE code → UF
+                or loc.replace("BR-", "").upper()            # ISO-3 fallback
+            )
+            if clicked_uf in ufs and clicked_uf != st.session_state.selected_uf:
                 st.session_state.selected_uf = loc
                 st.session_state.selected_zone = None
                 st.session_state.selected_candidate = None
